@@ -1,0 +1,10 @@
+#!/bin/sh
+
+sudo killall driver
+sudo killall server
+sudo killall onmycommand
+sudo killall perf
+sudo killall cacheperf
+killall network_rtt
+#sudo killall batch
+sudo killall greeter_async_server

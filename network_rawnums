@@ -1,0 +1,156 @@
+#!/bin/sh
+
+readonly DATA_POINT_DELIM_REGEX='RUNNING [A-Z]\+:'
+readonly            FIELDS_LIST="table_entries round_trip_time"
+readonly    SAMPLE_REGEX_CLIENT='.*remote: Completed after: \([0-9]\+\) us.*'
+readonly    SAMPLE_REGEX_SERVER='.*Computed in: \([0-9]\+\) us.*'
+readonly     SERIES_LIST_CLIENT="baseline basealloc contention allocation"
+readonly   SERIES_SUFFIX_SERVER="_overhead"
+
+set -e
+. ./postprocess.sh
+
+puts() {
+	printf '%s\n' "$@"
+}
+
+iter_deref() {
+	local var="$1"
+	eval puts '"$'"$var"'"' | head -n "$samples_per_point"
+}
+
+iter_advance() {
+	local var="$1"
+	eval "$var='`eval puts '"$'"$var"'"' | tail -n +"$((samples_per_point + 1))"`'"
+}
+
+iter_empty() {
+	local logvar="$1"
+	[ -z "`iter_deref "$logvar"`" ]
+}
+
+copyseries() {
+	local serieslist="$1"
+	local entryindex="$2"
+	local logvar="$3"
+
+	set -e
+	for seriesname in $serieslist
+	do
+		echo -n .
+		reuse "data.$seriesname.samples[$entryindex].$independent" integer
+		[ "`iter_deref "$logvar" | wc -l`" -eq "$samples_per_point" ] || { echo "Missing expected number of samples for data point: the log must be missing some entries!" >&2 && false; }
+		iter_deref "$logvar" | sed '1i\unstructured\ninteger' | jaguar/jaguar set "$outfile" "data.$seriesname.samples[$entryindex].$dependent" array -
+		iter_advance "$logvar"
+	done
+}
+
+calculateoh() {
+	local clientvar="$1"
+	local servervar="$2"
+
+	local origlen="`puts "$servervar" | wc -l`"
+	set -e
+	[ -p allclients ] || mkfifo allclients
+	eval puts '"$'"$clientvar"'"' >allclients &
+	[ -p allservers ] || mkfifo allservers
+	eval puts '"$'"$servervar"'"' >allservers &
+	eval "$servervar='`paste -d"-\n" allclients allservers | bc`'"
+	rm allclients allservers
+	[ "`puts "$servervar" | wc -l`" -eq "$origlen" ]
+}
+
+[ "`puts "$FIELDS_LIST" | wc -w`" -eq 2 ]
+readonly independent="`puts "$FIELDS_LIST" | cut -d" " -f1`"
+readonly dependent="`puts "$FIELDS_LIST" | cut -d" " -f2`"
+readonly series_list_server="`puts "$SERIES_LIST_CLIENT" | sed "s/ \|$/$SERIES_SUFFIX_SERVER&/g"`"
+
+echo -n "Munging experiment log"
+
+log="`decode log`"
+echo -n .
+log_client="`puts "$log" | grep -e "$DATA_POINT_DELIM_REGEX" -e "$SAMPLE_REGEX_CLIENT"`"
+echo -n .
+readonly sample_delims="`puts "$log_client" | grep -n "$DATA_POINT_DELIM_REGEX"`"
+echo -n .
+readonly series_per_machine="`puts "$SERIES_LIST_CLIENT" | wc -w`"
+echo -n .
+readonly points_per_series="`puts "$sample_delims" | wc -l | sed '$a\'"$series_per_machine" | paste -sd/ | bc`"
+echo -n .
+readonly samples_per_point="`puts "$sample_delims" | cut -d: -f1 | tac | head -n2 | sed '$a\1' | paste -sd- | bc`"
+echo
+
+cat <<-tac
+
+	According to the log, this experiemnt appears to have had the following parameters:
+	   Data series:              $((series_per_machine * 2))
+	   Series from each machine: $series_per_machine
+	   Data points per series:   $points_per_series
+	   Samples per data point:   $samples_per_point
+tac
+echo -n "Is this correct (y/N)? "
+read approved
+[ "$approved" = "y" ] || { echo "Not confirmed; aborting!" >&2 && false; }
+unset approved
+echo
+
+echo -n "Classifying log data"
+log_client="`puts "$log_client" | sed -n "s/$SAMPLE_REGEX_CLIENT/\1/p"`"
+echo -n .
+log_server="`puts "$log" | sed -n "s/$SAMPLE_REGEX_SERVER/\1/p"`"
+echo -n .
+unset log
+echo
+
+echo -n "Copying legend entries"
+for field in $FIELDS_LIST
+do
+	reuse "legend.samples.$field.description" string
+	echo -n .
+	reuse "legend.samples.$field.unit" string
+	echo -n .
+done
+echo
+
+has_overheads="true"
+echo -n "Copying series labels"
+for series in $SERIES_LIST_CLIENT $series_list_server
+do
+	if grep -v "\<$series\>" "$SERIES_LIST_CLIENT" >/dev/null && ! jaguar/jaguar get "$infile" "data.$series.description" >/dev/null 2>&1
+	then
+		has_overheads="false"
+		break
+	fi
+
+	reuse "data.$series.description" string
+	echo -n .
+done
+echo
+
+if "$has_overheads"
+then
+	echo "Computing network overheads..."
+	calculateoh log_client log_server
+else
+	echo "No network overhead information found; skipping extraction!"
+fi
+
+for index in `seq 0 "$((points_per_series - 1))"`
+do
+	echo -n "Processing record index: $index..."
+
+	"$has_overheads" && echo -n "(client)"
+	copyseries "$SERIES_LIST_CLIENT" "$index" log_client
+
+	if "$has_overheads"
+	then
+		echo -n "(server)"
+		copyseries "$series_list_server" "$index" log_server
+	fi
+
+	echo
+done
+
+{ iter_empty log_client && iter_empty log_server; } || { echo "Extra leftover samples in log: we must have misparsed it!" >&2 && false; }
+
+echo "All done!  Result is in: $outfile"

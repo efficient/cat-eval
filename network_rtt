@@ -1,0 +1,756 @@
+#!/bin/sh
+
+# Pseudo-modifier for variable declarations.
+# Creates a constant with the specified default value, unless a specialization is found in the environment.
+sudo rm -rf ramdisk/perf*
+const() {
+	local ondefaulthandler=""
+	if [ $# -gt 1 ]
+	then
+		ondefaulthandler="$1"
+		shift
+	fi
+	local varname="`printf %s "$1" | cut -d= -f1`"
+	local vardef="`printf %s "$1" | cut -d= -f2-`"
+
+	if eval [ -z '"$'"$varname"'"' ]
+	then
+		eval "$varname"='"'"$vardef"'"'
+		[ -z "$ondefaulthandler" ] || "$ondefaulthandler" "$varname"
+	fi
+	eval readonly "$varname"
+}
+
+warn() {
+	local variable="$1"
+	echo "WARNING: $1 unspecified; using hardcoded default!" >&2
+}
+
+count() {
+	if [ -z "$undefcounter" ]
+	then
+		undefcounter="1"
+	else
+		undefcounter="$((undefcounter + 1))"
+	fi
+}
+
+const DEFAULT_NUM_TRASH="$(($(lscpu | grep Core | tr -s " " | rev | cut -d" " -f1 | rev) - 1))"
+const DEFAULT_NUM_TRASH_LOOP="`seq "$DEFAULT_NUM_TRASH" | paste -sd" "`"
+const DEFAULT_CLIENT_SLEEP="100000"
+const DEFAULT_CLIENT_SLEEP_LOOP="0 10 100 1000 10000 100000"
+const warn DEFAULT_TABLE_ENTRIES="131072"
+const count DEFAULT_TABLE_ENTRIES_LOOP="1 10 100 1000 10000 100000"
+const warn DEFAULT_ZIPF_ALPHA="0.99"
+const count DEFAULT_ZIPF_ALPHA_LOOP="0.00 0.90 0.99"
+const warn DEFAULT_MITE_TPUT_LIMIT="3.0"
+const count DEFAULT_MITE_TPUT_LIMIT_LOOP="0.2 0.4 0.6 0.8 1.0 1.2 1.4 1.6 1.8 2.0 2.2 2.4 2.6 2.8 3.0 3.2 3.4 3.6 3.8 4.0"
+const warn DEFAULT_CACHE_WAYS="0x003"
+const count DEFAULT_CACHE_WAYS_LOOP="0x007 0x00f 0x01f 0x03f 0x07f 0x0ff 0x1ff 0x3ff"
+
+const MICA_GET_RATIO="0.5"
+const MICA_RECORD_ITERATIONS="300000000"
+const PERF_RECORD_CORES="0"
+const PERF_RECORD_FLAGS="-s"
+const PERF_STAT_CORES="2,4,6,8,10,12,14,16,18,20,22,24,26,28,30"
+const PERF_STAT_FLAGS="-s"
+const KEEP_PERF_DATA="false"
+const TRASH_ALLOC="800"
+const WARMUP="600"
+
+if [ -n "$undefcounter" ]
+then
+	if [ "$undefcounter" -gt 3 ]
+	then
+		echo "WARNING: No DEFAULT_*_LOOP variable overridden; using hardcoded default!" >&2
+	elif [ "$undefcounter" -lt 3 ]
+	then
+		echo "WARNING: Multiple DEFAULT_*_LOOP variables overriden; one or more will be ignored!" >&2
+	fi
+fi
+
+CGROUP_PATH="/sys/fs/rscctrl"
+CGROUP_SUBMASK="schemas"
+if [ ! -e "$CGROUP_PATH/tasks" ]
+then
+	# Fall back to Linux 4.4 compatibility mode
+	CGROUP_PATH="/sys/fs/cgroup/intel_rdt"
+	CGROUP_SUBMASK="intel_rdt.l3_cbm"
+
+	if [ ! -e "$CGROUP_PATH/tasks" ]
+	then
+		echo "ERROR: OS doesn't appear to support CAT!" >&2
+		exit 1
+	fi
+fi
+readonly CGROUP_PATH
+readonly CGROUP_SUBMASK
+
+usage() {
+	cat <<-tac
+		USAGE: $0 <mode> <plugins> <host on which to run client process> <path to repo on remote system> <mac address of local interface on which to listen>
+
+		<mode> is one of:
+		 -p: Vary the number of contender processes or threads
+		 -s: Vary sleep and fix the number of table entries at $DEFAULT_TABLE_ENTRIES
+		 -t: Vary number of table entries and fix the sleep at $DEFAULT_CLIENT_SLEEP s
+		 -z: Vary zipf alpha
+		 -l: Vary the mite throughput limit
+		 -m: Vary the number of ways allocated to the mite
+		 -c: Vary the number of ways allocated to Trash
+
+		<plugins> is a comma-separated list of:
+	tac
+	ls networked/*.sh | sed 's/.*\/\([^/]*\).sh/ \1/'
+}
+
+num_trash="$DEFAULT_NUM_TRASH"
+client_sleep="$DEFAULT_CLIENT_SLEEP"
+table_entries="$DEFAULT_TABLE_ENTRIES"
+zipf_alpha="$DEFAULT_ZIPF_ALPHA"
+mite_tput_limit="$DEFAULT_MITE_TPUT_LIMIT"
+cache_ways="$DEFAULT_CACHE_WAYS"
+cache_partition_mite="true"
+understood="true"
+while "$understood"
+do
+	case "$1"
+	in
+		-p)
+			independent="num_trash"
+			iterator="$DEFAULT_NUM_TRASH_LOOP"
+			;;
+		-s)
+			independent="client_sleep"
+			iterator="$DEFAULT_CLIENT_SLEEP_LOOP"
+			;;
+		-t)
+			independent="table_entries"
+			iterator="$DEFAULT_TABLE_ENTRIES_LOOP"
+			;;
+		-z)
+			independent="zipf_alpha"
+			iterator="$DEFAULT_ZIPF_ALPHA_LOOP"
+			;;
+		-l)
+			independent="mite_tput_limit"
+			iterator="$DEFAULT_MITE_TPUT_LIMIT_LOOP"
+			;;
+		-m)
+			independent="cache_ways"
+			iterator="$DEFAULT_CACHE_WAYS_LOOP"
+			;;
+		-c)
+			cache_partition_mite="false"
+			independent="cache_ways"
+			iterator="$DEFAULT_CACHE_WAYS_LOOP"
+			;;
+		*)
+			understood="false"
+			;;
+	esac
+
+	if "$understood"
+	then
+		shift
+	fi
+done
+if [ -z "$independent" -o $# -ne 4 ]
+then
+	usage
+	exit 1
+fi
+plugins="$1"
+foreign_client="$2"
+remote_path="$3"
+local_macaddr="$4"
+
+logfilename="$CATBENCH_JAGFILE"
+
+for plugin in $(echo "$plugins" | sed -n 1'p' | tr ',' '\n')
+do
+	if [ -z "$plugin" -o ! -e "networked/$plugin.sh" ]
+	then
+		echo "$plugin: Unrecognized software system plugin!" >&2
+		exit 1
+	fi
+	. "networked/$plugin.sh"
+done
+. networked/.sh
+
+#localrev="`git log --no-abbrev-commit --no-decorate -1 | head -n1 | cut -d' ' -f2`"
+#remoterev="`ssh "$foreign_client" "cd '$remote_path'; git log --no-abbrev-commit --no-decorate -1 | head -n1 | cut -d' ' -f2"`"
+#if [ "$localrev" != "$remoterev" ]
+#then
+	#echo "ERROR: Version mismatch between systems!" >&2
+	#exit 2
+#fi
+
+remotemod="`ssh "$foreign_client" "cd '$remote_path'; git diff --exit-code --ignore-submodules=dirty HEAD >/dev/null; echo \\$?"`"
+if [ "$remotemod" -ne 0 ]
+then
+	echo "ERROR: Remote repository state uncommitted!" >&2
+	exit 3
+fi
+
+checkrevision() {
+	component="$1"
+	errorcode="$2"
+
+	whichrev="\"$`echo "$component" | tr [a-z] [A-Z]`_MIN_REV\""
+	whichchk="\"check${component}rev\""
+
+	#if eval [ -n "$whichrev" ] && ! eval "$whichchk"
+	#then
+		#eval printf "\"ERROR: Component '$component' is older than minimum supported version ('%s')!\n\"" "$whichrev" >&2
+		#exit "$errorcode"
+	#fi
+}
+
+#checkrevision server 4
+#checkrevision client 5
+#checkrevision contender 6
+
+if [ ! -x setpgrp ]
+then
+	echo "ERROR: setpgrp binary not found; did you build it?" >&2
+	exit 7
+fi
+
+eval printf '"%s\n"' '"$SERVER_DIR/$SERVER_BIN"' '"$CONTENDER_DIR/$CONTENDER_BIN"' $EXPECTS_FILES | while read prereqfile
+do
+	if [ ! -e "$prereqfile" ]
+	then
+		echo "ERROR: Required file '$prereqfile' couldn't be found!" >&2
+		exit 8
+	fi
+done || exit $?
+
+if [ -z "$logfilename" ]
+then
+	cat >&2 <<-tac
+		$0: should be invoked via driver
+	tac
+	exit 1
+fi
+
+if [ -e .network_rtt_pw ]
+then
+	passwd="`cat .network_rtt_pw`"
+else
+	echo -n "Remote sudo password? "
+	stty -echo
+	read passwd
+	stty echo
+	echo
+fi
+
+sudo killall "$SERVER_BIN" 2>/dev/null
+ssh "$foreign_client" "echo '$passwd' | sudo -S killall '$CLIENT_BIN' 2>/dev/null"
+sudo killall "$CONTENDER_BIN" 2>/dev/null
+
+if [ "$independent" = "num_trash" ]
+then
+	jaguar/jaguar set "$logfilename" legend.samples.num_trash.description string "Cores running contender"
+	jaguar/jaguar set "$logfilename" legend.samples.num_trash.unit string ""
+elif [ "$independent" = "client_sleep" ]
+then
+	jaguar/jaguar set "$logfilename" legend.samples.client_sleep.description string "Delay between client requests"
+	jaguar/jaguar set "$logfilename" legend.samples.client_sleep.unit string "us"
+elif [ "$independent" = "table_entries" ]
+then
+	jaguar/jaguar set "$logfilename" legend.samples.table_entries.description string "Mite server working set size"
+	jaguar/jaguar set "$logfilename" legend.samples.table_entries.unit string ""
+elif [ "$independent" = "zipf_alpha" ]
+then
+	jaguar/jaguar set "$logfilename" legend.samples.zipf_alpha.description string "Alpha parameter of zipf distribution"
+	jaguar/jaguar set "$logfilename" legend.samples.zipf_alpha.unit string ""
+elif [ "$independent" = "mite_tput_limit" ]
+then
+	jaguar/jaguar set "$logfilename" legend.samples.mite_tput_limit.description string "Mite throughput limit"
+	jaguar/jaguar set "$logfilename" legend.samples.mite_tput_limit.unit string "Mops"
+elif [ "$independent" = "cache_ways" ]
+then
+	if "$cache_partition_mite"
+	then
+		way_description="#ways allocated exclusively to the mite"
+	else
+		way_description="#ways allocated to contenders (shared with mite)"
+	fi
+	jaguar/jaguar set "$logfilename" legend.samples.cache_ways.description string "$way_description"
+	jaguar/jaguar set "$logfilename" legend.samples.cache_ways.unit string ""
+	unset way_description
+else
+	echo "Internal ERROR, invalid independent variable. (Perhaps you forgot to add a jaguar entry for this independent variable?" >&2
+	exit 4
+fi
+
+jaguar/jaguar set "$logfilename" legend.samples.mite_throughput.description string "Mite Throughput"
+jaguar/jaguar set "$logfilename" legend.samples.mite_throughput.unit string "Mops"
+
+jaguar/jaguar set "$logfilename" legend.samples.mean.description string "Mean RTT"
+jaguar/jaguar set "$logfilename" legend.samples.mean.unit string "us"
+
+jaguar/jaguar set "$logfilename" legend.samples.999tail-latency.description string "99.9th percentile tail RTT"
+jaguar/jaguar set "$logfilename" legend.samples.999tail-latency.unit string "us"
+
+jaguar/jaguar set "$logfilename" legend.samples.99tail-latency.description string "99th percentile tail RTT"
+jaguar/jaguar set "$logfilename" legend.samples.99tail-latency.unit string "us"
+
+jaguar/jaguar set "$logfilename" legend.samples.95tail-latency.description string "95th percentile tail RTT"
+jaguar/jaguar set "$logfilename" legend.samples.95tail-latency.unit string "us"
+
+jaguar/jaguar set "$logfilename" legend.samples.50tail-latency.description string "Median tail RTT"
+jaguar/jaguar set "$logfilename" legend.samples.50tail-latency.unit string "us"
+
+jaguar/jaguar set "$logfilename" legend.samples.contender_tput.description string "Contender throughput"
+jaguar/jaguar set "$logfilename" legend.samples.contender_tput.unit string "$CONTENDER_TPUT_UNIT"
+
+jaguar/jaguar set "$logfilename" legend.samples.perf_data.description string "Perf datafile"
+jaguar/jaguar set "$logfilename" legend.samples.perf_data.unit string "all ur base64s are belong to me"
+
+jaguar/jaguar set "$logfilename" legend.samples.intel_cqm/local_bytes.description string "System-wide memory bandwidth usage"
+jaguar/jaguar set "$logfilename" legend.samples.intel_cqm/local_bytes.unit string "MB/s"
+
+"$KEEP_PERF_DATA" && (base64 -w0 "$SERVER_DIR/$SERVER_BIN" | jaguar/jaguar set "$logfilename" meta.server_binary string -)
+
+setdefaultmask() {
+	groupname="$1"
+	groupmask="$2"
+
+	sudo mkdir "$CGROUP_PATH/$groupname"
+	if [ "$CGROUP_SUBMASK" = "schemas" ]
+	then
+		# Linux 4.7 mode
+		sudo sh -c "cat '$CGROUP_PATH/$groupname/$CGROUP_SUBMASK' | sed 's/=[^;]\+/=$groupmask/' >'$CGROUP_PATH/$groupname/$CGROUP_SUBMASK'"
+	elif [ "$CGROUP_SUBMASK" = "intel_rdt.l3_cbm" ]
+	then
+		# Linux 4.4 compatibility mode
+		sudo sh -c "echo '$groupmask' >'$CGROUP_PATH/$groupname/$CGROUP_SUBMASK'"
+	else
+		echo "INTERNAL ERROR: $CGROUP_SUBMASK: Unrecognized mask file type!" >&2
+		exit 1
+	fi
+	sudo sh -c "echo $$ >'$CGROUP_PATH/$groupname/tasks'"
+}
+
+unsetmask() {
+	sudo sh -c "echo $$ >'$CGROUP_PATH/tasks'"
+}
+
+mgdelete() {
+	groupname="$1"
+
+	if [ "$CGROUP_SUBMASK" = "schemas" ]
+	then
+		# Linux 4.7 mode
+		sudo rmdir "$CGROUP_PATH/$groupname"
+	elif [ "$CGROUP_SUBMASK" = "intel_rdt.l3_cbm" ]
+	then
+		# Linux 4.4 compatibility mode (requires cgdelete)
+		sudo cgdelete "intel_rdt:$groupname"
+	else
+		echo "INTERNAL ERROR: $CGROUP_SUBMASK: I don't know how to delete groups with this type of mask!" >&2
+		exit 1
+	fi
+}
+
+countfreepages() {
+	sed -n 's/HugePages_Free:[[:space:]]\+\([[:digit:]]\)/\1/p' /proc/meminfo
+}
+
+waitforalloc() {
+	numpages="$1"
+	# Wait for the number of free hugepages to drop.
+	orig="`countfreepages`"
+	while [ "`countfreepages`" -eq "$orig" -a "$orig" -ne "$numpages" ]; do :; done
+
+	# Now wait for it to stabilize!
+	while [ "`sed -n 's/HugePages_Free:[[:space:]]\+\([[:digit:]]\)/\1/p' /proc/meminfo`" -ne "$orig" ]
+	do
+		orig="`countfreepages`"
+		sleep 1
+	done
+}
+
+waitforexit() {
+	arg0="$1"
+	while (ps -eo args | cut -d" " -f1 | grep -x "$arg0" >/dev/null 2>&1); do :; done
+}
+
+spawncontenders() {
+	contenders="$1"
+	mask="$2"
+
+	contender_pids=""
+
+	if [ "$contenders" -ne 0 -a -n "$mask" ]
+	then
+		if "$cache_partition_mite"
+		then
+			trashmask="`printf '%#x\n' $((((1 << $(cat /sys/devices/system/cpu/cpu0/cache/index3/ways_of_associativity)) - 1) - mask))`"
+		else
+			trashmask="$mask"
+		fi
+		echo "NETWORK_RTT: Setting mask to $trashmask..."
+		setdefaultmask trash "$trashmask"
+		unset trashmask
+	fi
+
+	if [ "$contenders" -ne 0 ]
+	then
+		if "$SINGLETON_CONTENDER"
+		then
+			cpu_mask=0
+			for contender in `seq "$contenders"`
+			do
+				cpu_mask=$((cpu_mask + (1 << ($(grep -m2 "physical id" /proc/cpuinfo | uniq | wc -l) * contender))))
+			done
+			cpu_mask="`printf '%#x' $cpu_mask`"
+			echo "NETWORK_RTT: Spawning singleton contender (cpu_mask=$cpu_mask)..."
+			time -p taskset "$cpu_mask" ./setpgrp "$CONTENDER_DIR/$CONTENDER_BIN" `gencontenderargs` >rtt_contender_0 2>&1 &
+			contender_pids="$contender_pids $!"
+		else
+			for contender in `seq "$contenders"`
+			do
+				cpu_mask="`printf '%#x' $((1 << ($(grep -m2 "physical id" /proc/cpuinfo | uniq | wc -l) * contender)))`"
+				if [ "$CONTENDER_BIN" = "hadoop_wrapper" ]
+				then
+					cpu_mask="0xffffffff"
+				fi
+				echo "NETWORK_RTT: Spawning contender $((contender - 1)) (cpu_mask=$cpu_mask)..."
+				time -p taskset "$cpu_mask" ./setpgrp "$CONTENDER_DIR/$CONTENDER_BIN" `gencontenderargs` >rtt_contender_$((contender - 1)) 2>&1 &
+				contender_pids="$contender_pids $!"
+			done
+		fi
+	fi
+
+	if [ -n "$mask" ]
+	then
+		echo "NETWORK_RTT: Unsetting mask..."
+		unsetmask
+	fi
+
+	echo "$contender_pids" >rtt_contender_pids
+}
+
+runtrial() {
+	contenders="0"
+	if [ -n "$1" ]
+	then
+		contenders="$1"
+	fi
+	mask="$2"
+
+	exitcode="0"
+
+	if [ -n "$mask" ] && "$cache_partition_mite"
+	then
+		echo "NETWORK_RTT: Setting mask to $mask..."
+		setdefaultmask lockserver "$mask"
+	fi
+	echo "NETWORK_RTT: Spawning server..."
+	prephugepages
+	eval "( cd '$SERVER_DIR'; sudo './$SERVER_BIN' `genserverargs` >'$PWD/rtt_server' )" &
+	awaitserverinit
+	unsetmask
+
+	echo "NETWORK_RTT: Spawning client..."
+	echo "No need to enter your password at this prompt!"
+
+
+	# set up remote pipes
+	ssh "$foreign_client" "cd '$remote_path'; rm -f rtt_client_pipe_in rtt_client_pipe_out; mkfifo rtt_client_pipe_in rtt_client_pipe_out"
+
+	# set up local pipes
+	rm -f rtt_client_pipe_in rtt_client_pipe_out; mkfifo rtt_client_pipe_in rtt_client_pipe_out
+
+	# connect pipes
+	ssh "$foreign_client" "cd '$remote_path'; cat >rtt_client_pipe_in" <rtt_client_pipe_in &
+	rtt_cient_pipe_in_pid=$!
+	ssh "$foreign_client" "cd '$remote_path'; cat rtt_client_pipe_out" >rtt_client_pipe_out &
+	rtt_cient_pipe_out_pid=$!
+
+	# run a dummy input to allow writing to the piped input multiple times
+	sleep 1h > rtt_client_pipe_in &
+	dummy_in_pid=$!
+
+	# launch remote client
+	if [ "$PERF_INIT_PHRASE" = "grpc" ]
+	then
+		ssh "$foreign_client" "cd '$remote_path'; rm -f rtt_client;
+		cd '$CLIENT_DIR'; sudo -S './$CLIENT_BIN' `genclientargs` <~/'$remote_path/rtt_client_pipe_in' | tee ~/'$remote_path/rtt_client' | (
+			{ echo ready; } &&
+			cat >/dev/null
+		) >~/'$remote_path/rtt_client_pipe_out'" &
+	else
+		ssh "$foreign_client" "cd '$remote_path'; rm -f rtt_client;
+		cd '$CLIENT_DIR'; sudo -S './$CLIENT_BIN' `genclientargs` <~/'$remote_path/rtt_client_pipe_in' | tee ~/'$remote_path/rtt_client' | (
+			{ timeout 120 grep -Fm1 '$PERF_INIT_PHRASE' >/dev/null && echo ready || echo timeout; } &&
+			cat >/dev/null
+		) >~/'$remote_path/rtt_client_pipe_out'" &
+	fi
+	client_pid=$!
+	echo "$passwd" >rtt_client_pipe_in
+
+	if [ "$SPAWNCONTENDERS" = "oninit" ]; then spawncontenders "$contenders" "$mask"; fi
+	oninit
+
+	# listen to client output
+	while read -r line <rtt_client_pipe_out
+	do
+		if [ "$line" = "timeout" -a $PERF_INIT_PHRASE != "grpc" ]
+		then
+			echo "WARNING: DPDK init timed out; restarting trial..." >&2
+			exitcode="1"
+			kill "$client_pid"
+			break
+		elif [ "$line" != "ready" -a $PERF_INIT_PHRASE != "grpc" ]
+		then
+			echo "ERROR: Unexpected output from pipe: %line" >&2
+			exit 1
+		fi
+
+		# warm up
+		if [ "$SPAWNCONTENDERS" = "onwarmup" ]; then spawncontenders "$contenders" "$mask"; fi
+		echo "NETWORK_RTT: Warming up... ($WARMUP_DURATION)"
+		onwarmup
+
+		# main processing
+		if [ "$SPAWNCONTENDERS" = "onmainprocessing" ]; then spawncontenders "$contenders" "$mask"; fi
+		echo "NETWORK_RTT: Main processing... ($MAIN_DURATION)"
+		taskset 0x4 perf stat -eintel_cqm/local_bytes/ -a 2>rtt_bandwidth &
+		sleep 1
+		taskset 0x4 ./cacheperf $PERF_STAT_FLAGS "$PERF_STAT_CORES" >rtt_contender_duration &
+		sleep 1
+		( cd ramdisk && taskset 0x4 ../cacheperf $PERF_RECORD_FLAGS "$PERF_RECORD_CORES" >../rtt_perf_duration ) &
+		sleep 5
+		echo "d\nr" >rtt_client_pipe_in
+		onmainprocessing
+
+		# stop
+		echo "NETWORK_RTT: Stopping..."
+		echo "s\n" >rtt_client_pipe_in
+		sleep 1
+		( cd ramdisk && taskset 0x4 ../cacheperf end >../rtt_perf )
+		taskset 0x4 ./cacheperf end >rtt_contender
+		killall -INT perf
+		wait "$client_pid"
+
+		break
+	done
+
+	echo "NETWORK_RTT: Cleaning up..."
+
+	sudo killall "$SERVER_BIN"
+	waitforexit "./$SERVER_BIN"
+	#cat rtt_server
+
+	kill $client_pipe_in_pid $client_pipe_out_pid $dummy_in_pid
+	wait $client_pipe_in_pid $client_pipe_out_pid $dummy_in_pid
+
+	killall -g "$CONTENDER_BIN"
+	if [ -n "$mask" ]
+	then
+		mgdelete lockserver
+		mgdelete trash
+	fi
+	scp -C "$foreign_client:$remote_path/rtt_client" .
+	sed 's/^/remote: /' rtt_client
+	#cat rtt_perf_duration
+	cat rtt_perf
+	#cat rtt_contender_duration
+	#cat rtt_contender
+	#cat rtt_bandwidth
+
+	return "$exitcode"
+}
+
+recordtrial() {
+	var="$1"
+	shift
+
+	redo="1"
+	while [ "$redo" -gt "0" ]
+	do
+		while ! runtrial "$@"; do :; done
+
+		tput="`extracttput`"
+		avg="`extractavelatency`"
+		all="`extractalllatencies | tail -n+"$((WARMUP + 1))" | sort -n`"
+		ct="`wc -l <<-cw | cut -d" " -f1
+				$all
+			cw`"
+		rtt_999="`extracttaillatency "$ct" 99.9 <<-ycnetalliattcartxe
+				$all
+			ycnetalliattcartxe`"
+		rtt_99="`extracttaillatency "$ct" 99 <<-ycnetalliattcartxe
+				$all
+			ycnetalliattcartxe`"
+		rtt_95="`extracttaillatency "$ct" 95 <<-ycnetalliattcartxe
+				$all
+			ycnetalliattcartxe`"
+		rtt_50="`extracttaillatency "$ct" 50 <<-ycnetalliattcartxe
+				$all
+			ycnetalliattcartxe`"
+		contender_tput="`extractcontendertput`"
+		if [ -z "$header" ]
+		then
+			if [ "$independent" = "cache_ways" ]
+			then
+				header="string"
+			else
+				header="fraction"
+			fi
+			header="$header,fraction,fraction,fraction,fraction,fraction,fraction,fraction,`cut -f1 rtt_perf | sed "s/.*/fraction/" | paste -sd, | sed p | paste -sd,`,fraction\n$independent,mite_throughput,mean,999tail-latency,99tail-latency,95tail-latency,50tail-latency,contender_tput,`tr "\t" " " <rtt_perf | cut -d" " -f1 | tr "." "/" | paste -sd, | sed 'p;s/^\|,/&contender-/g' | paste -sd,`,intel_cqm/local_bytes"
+			echo "$header"
+			baseline="$header"
+			basealloc="$header"
+			contention="$header"
+			allocation="$header"
+		fi
+
+		"$KEEP_PERF_DATA" || truncate --size=0 ramdisk/perf.data
+
+		total_time="`grep -F "seconds time elapsed" rtt_perf_duration | tr -s " " | cut -d" " -f2`"
+		contender_time="`grep -F "seconds time elapsed" rtt_contender_duration | tr -s " " | cut -d" " -f2`"
+		echo "============================================="
+		echo $tput
+		echo $avg
+		echo $rtt_999
+		echo $rtt_99
+		echo $rtt_95
+		echo $rtt_50
+		echo $contender_tput
+		echo "============================================="
+
+		# TODO: NEED TO CUT OFF THE TRAILING 's'!
+		MAIN_DURATION_COPY=${MAIN_DURATION%?}
+		if tail -n"$MAIN_DURATION_COPY" rtt_server | grep "32\.00 ppb" >/dev/null
+		then
+			echo
+			echo "~~~~~~~~~~~ WOAH, MATE! ~~~~~~~~~~~"
+			echo "NETWORK_RTT: Rejecting trial due to mysterious queueing behavior!"
+			echo "~~~~~~~~~~~ WOAH, MATE! ~~~~~~~~~~~"
+			echo
+			redo="$((redo - 1))"
+		else
+			redo="0"
+		fi
+	done
+
+	eval $var="\$$var\\\\n\$$independent,\$tput,\$avg,\$rtt_999,\$rtt_99,\$rtt_95,\$rtt_50,\$contender_tput,`cut -f2 rtt_perf | tr -d "," | sed "s:\$:/$total_time:" | bc -l | paste -sd,`,`cut -f2 rtt_contender | tr -d "," | sed "s:\$:/$total_time:" | bc -l | paste -sd,`,`grep -v ^$ rtt_bandwidth | tail -n+2 | tr -d , | tr -s " " | cut -d" " -f2 | paste -sd/ | bc -l`"
+}
+
+estimatetotal() {
+	start_time="$1"
+	trial_index="$2"
+	trial_count="$3"
+	current_time="$(date +%s)"
+	echo "$(((current_time - start_time) * trial_count / trial_index))"
+}
+
+estimateremaining() {
+	start_time="$1"
+	trial_index="$2"
+	trial_count="$3"
+	current_time="$(date +%s)"
+	echo "$(((current_time - start_time) * (trial_count - trial_index) / trial_index))"
+}
+
+formattime() {
+	t="$1"
+	s="$((t % 60))"
+	m="$((t / 60 % 60))"
+	h="$((t / 3600))"
+	printf "%d:%02d:%02d" "$h" "$m" "$s"
+}
+
+printprogress() {
+	start_time="$1"
+	trial_index="$2"
+	trial_count="$3"
+
+	printf "(%d/%d) " "$trial_index" "$trial_count"
+
+	t="`estimatetotal "$@"`"
+	formattime "$t"
+	echo -n " total; "
+
+	t="`estimateremaining "$@"`"
+	formattime "$t"
+	echo " left"
+}
+
+header=""
+
+jaguar/jaguar set "$logfilename" data.baseline.description string "Baseline"
+jaguar/jaguar set "$logfilename" data.basealloc.description string "Basealloc"
+jaguar/jaguar set "$logfilename" data.contention.description string "Contention"
+jaguar/jaguar set "$logfilename" data.allocation.description string "Allocation"
+
+start_time="$(date +%s)"
+trial_index=0
+iteration_count=0; for input in $iterator; do iteration_count="$((iteration_count + 1))"; done
+trial_count="$((iteration_count * 4))"
+
+sudo -l >/dev/null
+firstrun="true"
+for input in $iterator
+do
+	eval $independent=$input
+	eval cat <<-tac
+
+		=================
+
+		RUNNING ITERATION: $input
+
+	tac
+	#if [ "$independent" != "num_trash" -a "$independent" != "cache_ways" ] || "$firstrun"
+	#then
+	#	recordtrial baseline
+	#fi
+	trial_index=$((trial_index + 1)); printprogress "$start_time" "$trial_index" "$trial_count"
+	eval cat <<-tac
+
+		RUNNING TRIAL: $input basealloc
+
+	tac
+	#if [ "$independent" != "num_trash" ] || "$firstrun"
+	#then
+		#recordtrial basealloc 0 "$cache_ways"
+	#fi
+	trial_index=$((trial_index + 1)); printprogress "$start_time" "$trial_index" "$trial_count"
+	eval cat <<-tac
+
+		RUNNING TRIAL: $input contention
+
+	tac
+	if [ "$independent" != "cache_ways" ] || "$firstrun"
+	then
+		recordtrial contention "$num_trash"
+	fi
+	trial_index=$((trial_index + 1)); printprogress "$start_time" "$trial_index" "$trial_count"
+	eval cat <<-tac
+
+		RUNNING TRIAL: $input allocation
+
+	tac
+	recordtrial allocation "$num_trash" "$cache_ways"
+	trial_index=$((trial_index + 1)); printprogress "$start_time" "$trial_index" "$trial_count"
+
+	firstrun="false"
+done
+
+echo "$baseline" | perl -pe 's/,,/,0,/g; s/,,/,0,/g' | jaguar/jaguar set "$logfilename" data.baseline.samples array -
+echo "$basealloc" | perl -pe 's/,,/,0,/g; s/,,/,0,/g' | jaguar/jaguar set "$logfilename" data.basealloc.samples array -
+echo "$contention" | perl -pe 's/,,/,0,/g; s/,,/,0,/g' | jaguar/jaguar set "$logfilename" data.contention.samples array -
+echo "$allocation" | perl -pe 's/,,/,0,/g; s/,,/,0,/g' | jaguar/jaguar set "$logfilename" data.allocation.samples array -
+ssh "$foreign_client" rm -f "$remote_path/rtt_client"
+rm rtt_client
+rm rtt_server
+rm rtt_perf_duration
+rm rtt_perf
+rm rtt_contender_duration
+rm rtt_contender
+rm rtt_bandwidth

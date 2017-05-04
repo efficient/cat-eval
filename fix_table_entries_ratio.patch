@@ -1,0 +1,29 @@
+diff --git c/networked/mica.sh i/networked/mica.sh
+index 74194b6..74e92da 100644
+--- c/networked/mica.sh
++++ i/networked/mica.sh
+@@ -14,7 +14,13 @@ SERVER_MIN_REV="ec10efe"
+ CLIENT_MIN_REV="6306ebf"
+ 
+ genclientargs() {
+-	echo "-o /dev/null -p '$table_entries' '$MICA_GET_RATIO' '$zipf_alpha' '$mite_tput_limit'"
++	local multiplier="1"
++	if type genclientargs_table_entries_multiplier >/dev/null 2>&1
++	then
++		multiplier="`genclientargs_table_entries_multiplier`"
++	fi
++
++	echo "-o /dev/null -p '$((table_entries * multiplier))' '$MICA_GET_RATIO' '$zipf_alpha' '$mite_tput_limit'"
+ }
+ 
+ prephugepages() {
+diff --git c/networked/mica_wss_percentage.sh i/networked/mica_wss_percentage.sh
+new file mode 100644
+index 0000000..7420955
+--- /dev/null
++++ i/networked/mica_wss_percentage.sh
+@@ -0,0 +1,4 @@
++genclientargs_table_entries_multiplier() {
++	echo "mica_wss_percentage: Fixing table_entries PERCENTAGE instead of absolute value" >&2
++	echo "$cache_ways" | tr [a-z] [A-Z] | sed 's/0X/ibase=16; obase=2; /' | bc | tr -d "0\n" | wc -c
++}

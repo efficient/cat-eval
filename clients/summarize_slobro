@@ -1,0 +1,42 @@
+#!/bin/sh
+
+. ./summarize_helpers.sh
+
+if [ $# -lt 1 ]
+then
+	echo "USAGE: $0 <log file prefix>"
+	exit 1
+fi
+
+logprefix="$1"
+logfile="$logprefix.log"
+logfile_a="${logprefix}_a.csv"
+logfile_b="${logprefix}_b.csv"
+tool="pcm"
+
+truncate -s0 "$logfile_a"
+truncate -s0 "$logfile_b"
+
+driver_init square_evictions "$logfile"
+sudo ../external/pqos/pqos -e "llc:0=0xffc;llc:1=0x1;llc:2=0x2"
+sudo ../external/pqos/pqos -a "llc:1=0,1;llc:2=2"
+logstatus
+
+testprogargs="-n1 -c100 -e100 -hr"
+runlog taskset 0x1 ./square_evictions $testprogargs &
+
+sleep 2
+
+toolargs="0.001 -csv=\"$logfile_a\" -m"
+runtrial 0x2 ./square_evictions $testprogargs \&
+
+toolargs="0.001 -csv=\"$logfile_b\" -m"
+runtrial 0x4 ./square_evictions $testprogargs \&
+
+sleep 10
+
+runlog date +"%F;%T.%3N"
+runlog sudo ../external/pqos/pqos -a "llc:2=0"
+runlog date +"%F;%T.%3N"
+
+wait

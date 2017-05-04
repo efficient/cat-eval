@@ -1,0 +1,128 @@
+#!/bin/sh
+
+readonly COUNTERS="`echo "
+	cpu-cycles:cpu-cycles
+	instructions:instructions
+	cpu/event=0x0e,umask=0x01,cmask=0x01,inv,any/:stalled-cycles (UOPS_ISSUED.ANY)
+	L1-dcache-load-misses:L1-dcache-load-misses (L1D.REPLACEMENT)
+	L1-icache-load-misses:L1-icache-load-misses (ICACHE.MISSES)
+	dTLB-load-misses:dTLB-load-misses (DTLB_LOAD_MISSES.MISS_CAUSES_A_WALK)
+	iTLB-load-misses:iTLB-load-misses (ITLB_MISSES.MISS_CAUSES_A_WALK)
+	r81d0:MEM_UOPS_RETIRED.ALL_LOADS (i.e. L1-dcache-loads, dTLB-load-misses)
+	r08d1:MEM_LOAD_UOPS_RETIRED.L1_MISS
+	r10d1:MEM_LOAD_UOPS_RETIRED.L2_MISS
+	r20d1:MEM_LOAD_UOPS_RETIRED.L3_MISS (BDE70)
+	r2124:L2_RQSTS.DEMAND_DATA_RD_MISS
+	re124:L2_RQSTS.ALL_DEMAND_DATA_RD
+	re424:L2_RQSTS.ALL_CODE_RD
+	r01f0:L2_TRANS.DEMAND_DATA_RD
+	r04f0:L2_TRANS.CODE_RD
+	r2424:L2_RQSTS.CODE_RD_MISS (HSW)
+	r2724:L2_RQSTS.ALL_DEMAND_MISS (HSW)
+	re724:L2_RQSTS.ALL_DEMAND_REFERENCES (HSW)
+	r3f24:L2_RQSTS.MISS (HSW)
+	rff24:L2_RQSTS.REFERENCES (HSW)
+	r4f2e:LLC_REFERENCE (BDE70)
+	r412e:LLC_MISS (BDE70)
+	" | tail -n+2 | tr -d '\t'`"
+
+if [ $# -ne 2 -a \( $# -ne 1 -o "$1" != "end" \) ]
+then
+	cat <<-tac
+		USAGE: $0 <-r|-s> <<list,of,cores> | end>
+
+			-r means record a perf.data file
+			-s means only output aggregate statistics
+
+		Records cache-related performance counters on the specified cores
+		until called again with the 'end' argument.
+		Multiple invocations "stack."
+	tac
+	exit 1
+fi
+
+cores="$2"
+case "$1" in
+-r)
+	mode="record"
+	;;
+-s)
+	mode="stat"
+	;;
+end)
+	cores="$1"
+	;;
+*)
+	printf "%s\n" "$1: Unknown switch (expected -r or -s)" >&2
+	exit 1
+	;;
+esac
+set -e
+
+launch_record() {
+	sudo rm -f "perf.data.$cores"
+	ln -sf "perf.data.$cores" perf.data
+	sudo perf record -se"`echo "$COUNTERS" | cut -d: -f1 | paste -sd,`" --call-graph lbr -aC"$cores" -o perf.data time -f" %e seconds time elapsed" sleep inf 2>&1 &
+}
+
+report_record() {
+	perf report --stdio -iperf.data | grep -A1 '^# Samples:' | grep -v -- -- | sed "s/'//g" | rev | cut -d" " -f1 | rev | paste - - | eval sed `echo "$COUNTERS" | sed 's|.*|-e"s:&:"|'`
+}
+
+launch_stat() {
+	sudo perf stat -e"`echo "$COUNTERS" | cut -d: -f1 | paste -sd,`" 2>&1 -aC"$cores" | tee "perf.dat.$cores" | tail -n2 | tr -s " " &
+}
+
+report_stat() {
+	eval sed `echo "$COUNTERS" | sed 's|.*|-e"s:&:"|'` perf.dat | tail -n+4 | head -n-3 | tr -s " " | sed 's/ \([^ ]\+\) \([^#]\+\) .*/\2\t\1/' | tr -d ,
+}
+
+findproc() {
+	local regex="$1"
+	set -e
+
+	ps -eocomm,pgid,pid,cmd | tr -s " " | grep "$regex" | tail -n1
+}
+
+if [ "$cores" = "end" ]
+then
+	perfline="`findproc "^perf "`"
+	if [ -z "$perfline" ]
+	then
+		echo "No instances left to end"
+		exit 0
+	fi
+
+	perfpgid="`printf %s "$perfline" | cut -d" " -f2`"
+	perfpid="`printf %s "$perfline" | cut -d" " -f3`"
+	chldpid="`findproc "^sleep $perfpgid .*inf$" | cut -d" " -f3`"
+	if [ -n "$chldpid" ]
+	then
+		targetpid="$chldpid"
+	else
+		targetpid="$perfpid"
+	fi
+
+	sudo kill -int "$targetpid"
+	while ps -eopid | tr -d " " | grep -x "$perfpid" >/dev/null; do :; done
+
+	mode="`printf %s "$perfline" | sed 's/.\+perf \([^ ]\+\).*/\1/'`"
+	cores="`printf %s "$perfline" | sed 's/.*-aC\([^ ]\+\).*/\1/'`"
+	case "$mode" in
+	record)
+		ln -sf "perf.data.$cores" perf.data
+		sudo chown "`whoami`:" perf.data
+		mode="record"
+		;;
+	stat)
+		ln -sf "perf.dat.$cores" perf.dat
+		mode="stat"
+		;;
+	*)
+		echo "INTERNAL ERROR: Neither record nor stat?!" >&2
+		exit 2
+	esac
+	"report_$mode"
+else
+	"launch_$mode"
+fi

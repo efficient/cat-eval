@@ -1,0 +1,145 @@
+#!/bin/sh
+
+enable_cat=false
+logfile_name="lockserver_log"
+dataseries="lockserver"
+
+lockserver_alloc_percent=100
+trash_alloc_percent=100
+
+traverse_subset=0
+
+num_trash=8
+signal_iters=1
+signal_pause=0
+
+accesses_per_sample=163840000
+
+while [ $# -ge 1 ]
+do
+	case "$1" in
+	"-c")
+		enable_cat=true
+		;;
+	"-m")
+		lockserver_mask="$2"
+		shift
+		;;
+	"-p")
+		trash_mask="$2"
+		shift
+		;;
+	"-o")
+		logfile_name="$2"
+		shift
+		;;
+	"-d")
+		dataseries="$2"
+		shift
+		;;
+	"-l")
+		lockserver_alloc_percent="$2"
+		shift
+		;;
+	"-t")
+		trash_alloc_percent="$2"
+		shift
+		;;
+	"-s")
+		traverse_subset="$2"
+		accesses_per_sample="$2"
+		shift
+		;;
+	"-n")
+		num_trash="$2"
+		shift
+		;;
+	"-i")
+		signal_iters="$2"
+		shift
+		;;
+	"-w")
+		# NB: Make certain this value (microseconds) is long enough to allow each -s-access
+		#     subset to complete; otherwise, some of the signals will be missed!
+		signal_pause="$2"
+		shift
+		;;
+	"-a")
+		extra_args="$2"
+		shift
+		;;
+	*)
+		echo "Invalid argument"
+		exit 1
+	esac
+	shift
+done
+
+cgroup_path="/sys/fs/cgroup/intel_rdt"
+
+if "$enable_cat"
+then
+	if [ -z "$lockserver_mask" -o -z "$trash_mask" ]
+	then
+		echo "WOAH: You passed in -c, so I also require an explicit -m (lockserver mask) and -p (get trashed)" >&2
+		exit 1
+	fi
+else
+	# Default value should be the OR of trash_mask and lockserver_mask if $enable_cat is true
+	trash_mask=0xfff
+fi
+
+mkdir $cgroup_path/trash
+echo $trash_mask > $cgroup_path/trash/intel_rdt.l3_cbm
+#by doing this, our child processes are automatically added to the trash cgroup
+echo $$ > $cgroup_path/trash/tasks
+
+# This is the lockserver, which performs 327.62M memory accesses and then exits
+clients/square_evictions_wrapper "$dataseries" -p $((10000 * 100 / lockserver_alloc_percent)) -n 1 -c "$lockserver_alloc_percent" -e "$lockserver_alloc_percent" -hr -ia "$traverse_subset" -w $extra_args >"$logfile_name" 2>"$logfile_name.err" &
+rawpid="`while ! (ps -eo pid,args | sed 's/^ \+//' | cut -d" " -f1-2 | grep -w clients/square_evictions); do :; done`"
+pid="`echo "$rawpid" | cut -d" " -f1`"
+
+if "$enable_cat"
+then
+	mkdir $cgroup_path/lockserver
+	echo $pid > $cgroup_path/lockserver/tasks
+	echo $lockserver_mask > $cgroup_path/lockserver/intel_rdt.l3_cbm
+fi
+
+
+for var in `seq 1 "$num_trash"`; do
+	clients/square_evictions -c "$trash_alloc_percent" -e "$trash_alloc_percent" -hr > /dev/null &
+done
+sleep 10
+
+for var in `seq 1 "$signal_iters"`
+do
+	kill -s 10 $pid
+	usleep "$signal_pause"
+done
+
+# Sleep to allow our processes to actually run for a little while
+sleep 2
+
+# Don't kill the contending processes until the lockserver has gracefully exited.
+# Without this, the teardown interval will creep into our results!
+kill "$pid"
+while (ps -eo pid | grep -x "$pid" >/dev/null 2>&1); do :; done
+
+# CLEANUP
+killall square_evictions
+[ "$num_trash" -ne 0 ] && while (ps -eo args | cut -d" " -f1 | grep -x clients/square_evictions >/dev/null 2>&1); do :; done
+cgdelete intel_rdt:trash
+if "$enable_cat"
+then
+	cgdelete intel_rdt:lockserver
+fi
+
+normalized="$(echo "`./avg_data.pl "$logfile_name"` / $accesses_per_sample" | bc -l)"
+santycheck="$(echo "1 / `./avg_data.pl "$logfile_name.err" accesses/s`" | bc -l)"
+
+if [ "`printf 'define abs(n) { if(n >= 0) return(n) else return(-n) }\nabs(%s - %s) / %s >= 0.5\n' "$normalized" "$santycheck" "$santycheck" | bc -l`" -ne 0 ]
+then
+	echo "WARN: Normalized result (`echo "$normalized" | head -n1`) at least 5% off from sanity check (`echo "$santycheck"`)!" >&2
+fi
+echo "$normalized"

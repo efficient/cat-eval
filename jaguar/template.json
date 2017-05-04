@@ -1,0 +1,21 @@
+{
+	"data": {},
+	"legend": {
+		"args": {},
+		"samples": {}
+	},
+	"meta": {
+		"command": "",
+		"commit": "",
+		"date": "",
+		"exit": -1,
+		"log": "",
+		"message": "",
+		"patch": "",
+		"perf": "",
+		"status": "",
+		"submodule": "",
+		"uname": "",
+		"unpack": ""
+	}
+}

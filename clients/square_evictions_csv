@@ -1,0 +1,191 @@
+#!/bin/sh
+
+entry_already_exists() {
+	"$jaguar_script" get "$outfile_json" "$1" >/dev/null 2>&1
+}
+
+add_legend_entry() {
+	local switch="$1"
+	local terse="$2"
+	local description="$3"
+	local unit="$4"
+	if ! entry_already_exists "$legendpre.$switch"
+	then
+		"$jaguar_script" set "$outfile_json" "$legendpre.$switch.terse" string "$terse"
+		"$jaguar_script" set "$outfile_json" "$legendpre.$switch.description" string "$description"
+		"$jaguar_script" set "$outfile_json" "$legendpre.$switch.unit" string "$unit"
+	fi
+}
+
+jaguar_script="`dirname "$0"`/../jaguar/jaguar"
+if [ ! -e "$jaguar_script" ]
+then
+	echo "ERROR: Couldn't find jaguar script. You didn't pass me to a shell instead of executing me directly, did you?" >&2
+	exit 1
+fi
+if [ $# -lt 2 ]
+then
+	echo "USAGE: $0 <outfile> <dataseries> [arguments]..."
+	exit 1
+fi
+outfile_json="$1"
+series="$2"
+shift 2
+
+[ -e "$outfile_json" ] || "$jaguar_script" init "$outfile_json"
+
+legendpre="legend.args.square_evictions"
+datapre="data.$series"
+types="string,integer"
+header=""
+
+# TODO: custfacts should be saved as a string, but we currently only do ints
+seen_hugepages="false"
+seen_randomize="false"
+seen_singlerng="false"
+seen_norngspin="false"
+seen_custfacts="false"
+seen_memcheck="false"
+seen_cpucheck="false"
+seen_logprfchr="false"
+seen_profmemac="false"
+seen_daemonize="false"
+
+add_legend_entry -h "hugepages" "use hugepages"
+add_legend_entry -r "randomize" "random traversal order"
+add_legend_entry -s "single_rng" "use the same rng for all phases"
+add_legend_entry -q "dont_spin_rng" "reject out-of-range rng results"
+add_legend_entry -f "custom_rng_facts" "provided custom prime factors"
+add_legend_entry -w "memcheck" "sanity-check memory throughput"
+add_legend_entry -v "cpucheck" "sanity-check guess clock speed"
+add_legend_entry -l "perf" "record perf data"
+add_legend_entry -m "rdtscp" "profile memory accesses with rdtscp"
+add_legend_entry -i "daemonize" "perform traversals on signal"
+
+while [ $# -gt 0 ]
+do
+	lastheader="$header"
+
+	switch="$1"
+	shift
+
+	case "$switch" in
+	-n*)
+		header="$header\n-n"
+		add_legend_entry -n "periods" "number of periods"
+		;;
+	-p*)
+		header="$header\n-p"
+		add_legend_entry -p "passes_per_phase" "passes per phase"
+		;;
+	-c*)
+		header="$header\n-c"
+		add_legend_entry -c "contracted_percent" "small traversal subset" "% of a cache way"
+		;;
+	-e*)
+		header="$header\n-e"
+		add_legend_entry -e "expanded_percent" "large traversal/allocation" "% of a cache way"
+		;;
+	-h*)
+		seen_hugepages="true"
+		;;
+	-r*)
+		seen_randomize="true"
+
+		case "$1" in
+		-*)
+			;;
+		*)
+			shift
+			;;
+		esac
+		continue
+		;;
+	-q*)
+		seen_norngspin="true"
+		;;
+	-f*)
+		seen_custfacts="true"
+
+		case "$1" in
+		-*)
+			;;
+		*)
+			shift
+			;;
+		esac
+		continue
+		;;
+	-s*)
+		seen_singlerng="true"
+		;;
+	-w*)
+		seen_memcheck="true"
+		;;
+	-v*)
+		seen_cpucheck="true"
+		;;
+	-l*)
+		seen_logprfchr="true"
+
+		case "$1" in
+		-*)
+			;;
+		*)
+			shift
+			;;
+		esac
+		continue
+		;;
+	-j*)
+		header="$header\n-j"
+		add_legend_entry -j "perf_stride" "perf logging frequency"
+		;;
+	-m*)
+		seen_profmemac="true"
+		;;
+	-a*)
+		header="$header\n-a"
+		add_legend_entry -a "accesses_per_activation" "accesses per activation"
+		;;
+	-b*)
+		header="$header\n-b"
+		add_legend_entry -b "rng_skip" "initial random numbers to skip"
+		;;
+	-i*)
+		seen_daemonize="true"
+		;;
+	*)
+		echo "Unexpected switch: $switch"
+		exit 1
+		;;
+	esac
+
+	suffix="`printf %s "$switch" | sed 's/..\(.*\)/\1/'`"
+	case "$suffix" in
+	[a-z]*)
+		set -- "-$suffix" "$@"
+		;;
+	*)
+		if [ "$header" = "$lastheader" ]
+		then
+			continue
+		fi
+
+		if [ -n "$suffix" ]
+		then
+			header="$header,$suffix"
+		else
+			header="$header,$1"
+			shift
+		fi
+		;;
+	esac
+done
+
+"$jaguar_script" set "$outfile_json" "$datapre.type" string square_evictions
+echo "string,boolean\nname,value\n-h,$seen_hugepages\n-r,$seen_randomize\n-s,$seen_singlerng\n-q,$seen_norngspin\n-f,$seen_custfacts\n-w,$seen_memcheck\n-v,$seen_cpucheck\n-l,$seen_logprfchr\n-m,$seen_profmemac\n-i,$seen_daemonize" | "$jaguar_script" set "$outfile_json" "$datapre.args" array -
+if [ -n "$header" ]
+then
+	echo "$types\nname,value$header" | sed 's/^,//' | "$jaguar_script" set "$outfile_json" "$datapre.args[]" -
+fi
